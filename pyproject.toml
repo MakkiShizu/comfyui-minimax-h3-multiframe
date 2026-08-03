@@ -1,0 +1,12 @@
+[project]
+name = "comfyui-minimax-h3-multiframe"
+description = "First-N / last-N frame keyframe conditioning for MiniMax H3 (FL2VA)."
+version = "0.1.0"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.comfy]
+DisplayName = "MiniMax H3 Multi-Frame Keyframes"
+PublisherId = ""
+Icon = ""
