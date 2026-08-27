@@ -11,6 +11,16 @@ their frames occupy.
 Run lengths snap down to the VAE's grid (1, 5, 22, 39, ... frames). A tail run
 of 17j+5 frames starts at 17(m-j), which is where a target latent token starts,
 so the cond rows land exactly on the timeline positions they describe.
+
+Pinning (pin_frames, default on): beyond the soft keyframe conditioning, the node
+also emits a 'pin' spec listing the latent-token slots that each keyframe occupies
+together with the clean keyframe latent. Wire that spec through
+MiniMaxH3ApplyFramePin AFTER the sampler: it splices the clean latents back into
+the sampled latent at those slots, so the decoded video shows the exact input
+images at the pinned frames. This is a post-sampling operation and needs no
+retraining; it is the reliable way to truly freeze frames, because the DiT only
+receives keyframes as soft (never-denoised) context and never copies them into the
+output.
 """
 
 import torch
@@ -22,11 +32,17 @@ import node_helpers
 import nodes
 from comfy_api.latest import ComfyExtension, io
 
-from .grid import snap_condition_frames, temporal_shape, token_frame_offsets
+from .grid import (snap_condition_frames, temporal_shape, token_frame_offsets,
+                   build_pin_spec)
 
 LATENT_CHANNELS = 24
 AUDIO_LATENT_CHANNELS = 32
 SPATIAL_COMPRESSION = 16
+
+
+class PinSpec(io.Custom("minimax_pin_spec")):
+    """(token_slot, keyframe_latent[1,24,1,h,w]) pairs to splice into the sampled latent."""
+    Type = list
 
 
 def _resize(image, width, height, crop):
@@ -67,7 +83,9 @@ class MiniMaxH3MultiFrameToVideo(io.ComfyNode):
             description="First-N / last-N frame conditioning for MiniMax H3. Feeding a single image to "
                         "each input reproduces MiniMaxH3ImageToVideo exactly; longer runs anchor a whole "
                         "head or tail segment. The released FL2VA weights were trained on first/last "
-                        "keyframes only, so runs longer than one frame are outside the training set.",
+                        "keyframes only, so runs longer than one frame are outside the training set. "
+                        "Enable 'pin_frames' and wire the 'pin' output through MiniMaxH3ApplyFramePin "
+                        "(after the sampler) to freeze the conditioned frames to the exact input images.",
             inputs=[
                 io.Clip.Input("clip"),
                 io.Vae.Input("vae"),
@@ -85,6 +103,11 @@ class MiniMaxH3MultiFrameToVideo(io.ComfyNode):
                 io.Float.Input("cond_noise_aug", default=0.999, min=0.0, max=1.0, step=0.001,
                                tooltip="Timestep the keyframe rows are pinned at. 0.999 is the model default; "
                                        "lower values noise the conditioning down and loosen its grip."),
+                io.Boolean.Input("pin_frames", default=True, label_on="pinned", label_off="soft only",
+                                 tooltip="When on, also emit a 'pin' spec so MiniMaxH3ApplyFramePin can freeze "
+                                         "the conditioned frames to the exact input images after sampling. Off = "
+                                         "soft keyframe conditioning only (frames are guided but not guaranteed "
+                                         "pixel-identical)."),
                 io.Image.Input("first_frames", optional=True,
                                tooltip="Run starting at frame 0, in order. Truncated to the VAE grid "
                                        "(1, 5, 22, 39, ... frames)."),
@@ -92,12 +115,15 @@ class MiniMaxH3MultiFrameToVideo(io.ComfyNode):
                                tooltip="Run ending on the final frame, in order. The last N frames are kept, "
                                        "truncated to the VAE grid (1, 5, 22, 39, ... frames)."),
             ],
-            outputs=[io.Conditioning.Output(display_name="positive"), io.Latent.Output()],
+            outputs=[io.Conditioning.Output(display_name="positive"),
+                     io.Latent.Output(),
+                     PinSpec.Output(display_name="pin")],
         )
 
     @classmethod
     def execute(cls, clip, vae, prompt, width, height, length, prompt_frames, cond_noise_aug,
-                first_frames=None, last_frames=None) -> io.NodeOutput:
+                pin_frames, first_frames=None, last_frames=None) -> io.NodeOutput:
+        _, latent_t, _ = temporal_shape(length)
         latent, frame_count = _empty_av_latent(width, height, length)
 
         # head is the geometry anchor and gets a plain stretch, the tail follows with a cover-crop
@@ -124,15 +150,52 @@ class MiniMaxH3MultiFrameToVideo(io.ComfyNode):
         tokens = clip.tokenize(prompt, images=images)
         cond = clip.encode_from_tokens_scheduled(tokens)
 
+        pin = build_pin_spec(keyframes, latent_t) if (pin_frames and keyframes) else []
+
         if keyframes:
             cond = node_helpers.conditioning_set_values(cond, {
                 "minimax_keyframes": keyframes,
                 "minimax_frame_count": frame_count,
                 "minimax_visual_cond_noise_aug": cond_noise_aug,
             })
-        return io.NodeOutput(cond, latent)
+        return io.NodeOutput(cond, latent, pin)
+
+
+class MiniMaxH3ApplyFramePin(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="MiniMaxH3ApplyFramePin",
+            display_name="MiniMax H3 Apply Frame Pin",
+            category="model/conditioning/minimax",
+            description="Splice the clean keyframe latents back into the sampled latent at the pinned "
+                        "token slots, so those frames decode to the exact input images. Place this AFTER "
+                        "the sampler and BEFORE VAE Decode. Connect its 'pin' input to the 'pin' output of "
+                        "MiniMaxH3MultiFrameToVideo. A no-op when the pin spec is empty (pin_frames off).",
+            inputs=[
+                io.Latent.Input("latent", tooltip="Sampled latent from the MiniMax H3 sampler."),
+                PinSpec.Input("pin", tooltip="Pin spec from MiniMaxH3MultiFrameToVideo."),
+            ],
+            outputs=[io.Latent.Output()],
+        )
+
+    @classmethod
+    def execute(cls, latent, pin) -> io.NodeOutput:
+        samples = latent["samples"]
+        is_nested = isinstance(samples, comfy.nested_tensor.NestedTensor)
+        video = samples.tensors[0] if is_nested else samples
+        if pin:
+            video = video.clone()
+            for slot, kf in pin:
+                # kf: [1, 24, 1, h, w] -> place its single latent token into video[:, :, slot]
+                video[0, :, slot, :, :] = kf[0, :, 0, :, :].to(device=video.device, dtype=video.dtype)
+            if is_nested:
+                samples = comfy.nested_tensor.NestedTensor((video, samples.tensors[1]))
+            else:
+                samples = video
+        return io.NodeOutput({"samples": samples})
 
 
 class MiniMaxH3MultiFrameExtension(ComfyExtension):
     async def get_node_list(self):
-        return [MiniMaxH3MultiFrameToVideo]
+        return [MiniMaxH3MultiFrameToVideo, MiniMaxH3ApplyFramePin]

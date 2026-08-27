@@ -60,3 +60,25 @@ def token_frame_offsets(latent_t):
         offsets.append(frame)
         frame += FRAME_PER_TOKEN[k % TOKENS_PER_CLIP]
     return offsets
+
+
+def token_slot_for_frame(pixel_index, latent_t):
+    """Latent-token slot in a full clip whose pixel-frame start equals pixel_index.
+
+    Every keyframe is recorded with the pixel-frame index its latent token begins
+    at (see _run_keyframes). The full-clip packing puts one latent token per entry
+    of token_frame_offsets(latent_t); this returns the slot whose offset matches,
+    so a caller can write the keyframe latent straight into video[:, :, slot].
+    """
+    offsets = token_frame_offsets(latent_t)
+    for s, o in enumerate(offsets):
+        if o == pixel_index:
+            return s
+    raise ValueError("MiniMax H3: pixel frame %d is not a latent-token boundary for "
+                     "latent_t=%d (offsets start %s...)" % (pixel_index, latent_t, offsets[:4]))
+
+
+def build_pin_spec(keyframes, latent_t):
+    """List of (token_slot, keyframe_latent[1,24,1,h,w]) for every keyframe."""
+    return [(token_slot_for_frame(kf["resolved_frame_index"], latent_t), kf["latent"])
+            for kf in keyframes]

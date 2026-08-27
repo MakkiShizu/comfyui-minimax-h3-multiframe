@@ -55,10 +55,15 @@ packages need to be installed**.
 
 ## Node and inputs
 
-Node: `MiniMax H3 Multi-Frame to Video` (`model/conditioning/minimax`)
-Outputs: `positive` (conditioning) + `latent` (empty video/audio latent with the correct timeline length)
+This repo provides two nodes (both under `model/conditioning/minimax`):
 
-### Input overview
+- **`MiniMax H3 Multi-Frame to Video`** — the main node. Outputs `positive` (conditioning) +
+  `latent` (empty video/audio latent with the correct timeline length) + `pin` (pin spec, see below).
+- **`MiniMax H3 Apply Frame Pin`** — the pin-apply node. Place it **after the sampler and before VAE
+  Decode**; it splices the clean keyframe latents from the `pin` spec back into the sampled latent's
+  corresponding token slots so those frames decode to the **exact input images**.
+
+### Input overview (main node)
 
 | Input | Description |
 | --- | --- |
@@ -67,6 +72,7 @@ Outputs: `positive` (conditioning) + `latent` (empty video/audio latent with the
 | `length` | Total output frame count (including the head/tail segments occupied by conditioning), 24 fps, rounded up to `17k+5` |
 | `prompt_frames` | Which two frames Qwen sees as `<Picture i>`. See section below |
 | `cond_noise_aug` | Timestep the keyframe rows are pinned at, default `0.999` (cleaner = stronger constraint) |
+| `pin_frames` | **Toggle, default ON (`pinned`)**. When on, the main node also outputs a `pin` spec so `Apply Frame Pin` can freeze the conditioned frames to the exact input images; when off, only soft conditioning is used (frames are guided but not guaranteed pixel-identical) |
 
 ---
 
@@ -131,6 +137,47 @@ So:
 
 `cond_noise_aug` direction: lower value → cleaner cond → tighter grip (still not a hard copy);
 higher value (toward 1) → blurrier cond → looser.
+
+---
+
+### Frame pinning (pin_frames + Apply Frame Pin) — actually freezing chosen frames to the source images
+
+The previous section showed keyframes are only **soft context** in the DiT and the output is generated
+end-to-end, so head/tail are not "pinned verbatim". But many workflows do need "the frames I fed in
+come out as those exact frames". This node achieves that with **post-sampling latent splicing**, no
+retraining required:
+
+1. With `pin_frames = ON` (default), besides the soft condition the main node also outputs a `pin` spec:
+   a list of `(latent token slot, clean keyframe latent)` — i.e. for each conditioned latent token, its
+   position in the full timeline plus the VAE-encoded source image it came from.
+2. Feed the main node's `latent` into the sampler, then feed the sampled result together with `pin` into
+   **`MiniMax H3 Apply Frame Pin`** (after the sampler, before VAE Decode).
+3. `Apply Frame Pin` overwrites the sampled latent at those slots with the clean latents
+   (`video[:, :, slot] = keyframe_latent`).
+4. Decode normally — the overwritten tokens decode back to the **input images** (VAE encode/decode is
+   near-lossless at that resolution), so those frames are pixel-exact.
+
+**Why it must be post-sampling and a second node?** A conditioning node can only feed the sampler; it
+never sees the sampler's output. And the DiT never copies keyframes into the output. The only reliable
+freeze is to overwrite the sampled latent at the conditioned token slots — standard latent-level video
+frame inpainting, independent of training, 100% reliable.
+
+**Slot mapping (verified by example):** each keyframe's `resolved_frame_index` is the pixel-frame its
+latent token starts at; the full-timeline token start pixels come from `token_frame_offsets(latent_t)`,
+their intersection gives the slot. For `frame_count = 124` (→ `latent_t = 37`): pixel frames
+`0, 1, 119, 120` → slots `0, 1, 35, 36`. The head run occupies the first slots, the tail run the last —
+both aligned to token boundaries.
+
+**Points**
+- `pin` is a custom-typed output (`minimax_pin_spec`); when `pin_frames` is off or no frames are given,
+  `pin` is an empty list and `Apply Frame Pin` becomes a no-op.
+- Pinned frames are the VAE-encoded input at generation resolution (head stretched, tail center-cropped,
+  consistent with what the model conditioned on), so they decode as the source images at that resolution.
+- Only the **conditioned frames** (head/tail runs) are pinned; the middle is still freely generated.
+  `pin_frames` does not change the soft condition — both stack: soft condition keeps the middle coherent
+  with the pinned frames, pinning guarantees the specified frames.
+- If you only want "strong guidance with slight drift", turn `pin_frames` off; then `Apply Frame Pin`
+  is not needed.
 
 ---
 
@@ -221,6 +268,12 @@ passes straight through to the core**, so the built-in node and existing workflo
 - `cond_noise_aug` exposes the core-supported-but-node-unset `minimax_visual_cond_noise_aug`.
 - `prompt_frames` only affects which frames Qwen takes as `<Picture>` (see above), and does not change
   the DiT keyframe condition.
+- With `pin_frames` (default ON), `grid.build_pin_spec` maps each keyframe to a `(token slot, clean
+  latent)` pair, emitted as the custom-typed `pin` output for `MiniMaxH3ApplyFramePin` to splice back
+  after sampling.
+- `MiniMaxH3ApplyFramePin`: pulls the video latent out of `latent["samples"]` (NestedTensor), does
+  `video[0, :, slot, :, :] = kf[0, :, 0, :, :]` for every `(slot, kf)`, and rebuilds the NestedTensor.
+  No-op when `pin` is empty.
 
 ### Equivalence with the built-in node
 
@@ -247,3 +300,6 @@ video body is 37×1008 rows. Attaching a 22-frame head segment (7 latent tokens)
 - Multi-frame continuous segment conditioning (especially non-anchor interior frames of a run) is
   outside the FL2VA training distribution; its visual quality and motion coherence are experimental —
   results depend on actual testing.
+- To truly pin frames (pixel-equal to input) you must connect the `MiniMax H3 Apply Frame Pin` node
+  (after sampling, before decoding) and feed it the main node's `pin` output; with `pin_frames` on but
+  that node absent, only soft conditioning applies and frames are not pinned.

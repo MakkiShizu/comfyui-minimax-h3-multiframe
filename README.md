@@ -49,10 +49,15 @@ raise ValueError("only first/last keyframe anchors are supported")
 
 ## 节点与输入
 
-节点：`MiniMax H3 Multi-Frame to Video`（`model/conditioning/minimax`）
-输出：`positive`（conditioning）+ `latent`（空视频/音频 latent，含正确的时间轴长度）
+本仓库提供两个节点（都在 `model/conditioning/minimax` 分类下）：
 
-### 输入一览
+- **`MiniMax H3 Multi-Frame to Video`** — 主节点。输出 `positive`（conditioning）+
+  `latent`（空视频/音频 latent，含正确的时间轴长度）+ `pin`（钉定规格，见下）。
+- **`MiniMax H3 Apply Frame Pin`** — 钉定应用节点。放在 **采样器之后、VAE 解码之前**，
+  把 `pin` 规格里的干净关键帧 latent 拼回采样结果的对应 token 槽位，使那些帧解码后
+  **精确等于输入图**。
+
+### 输入一览（主节点）
 
 | 输入 | 说明 |
 | --- | --- |
@@ -61,6 +66,9 @@ raise ValueError("only first/last keyframe anchors are supported")
 | `length` | 输出总帧数（含被条件占用的首尾段），24 fps，向上对齐到 `17k+5` |
 | `prompt_frames` | Qwen 侧看到哪两帧作 `<Picture i>`。详见下节 |
 | `cond_noise_aug` | 关键帧行被钉住的时间步，默认 `0.999`（越干净约束越强） |
+| `pin_frames` | **开关，默认开启（`pinned`）**。开启时主节点额外输出 `pin` 规格，经
+  `Apply Frame Pin` 节点把被条件占用的帧**钉死为输入原图**；关闭则只做软条件
+  （帧被引导但不保证逐像素一致） |
 
 ---
 
@@ -116,6 +124,43 @@ raise ValueError("only first/last keyframe anchors are supported")
 
 `cond_noise_aug` 的方向：值越低 → cond 越干净 → 抓得越紧（仍非硬拷贝）；
 值越高（趋近 1）→ 条件越糊 → 越松。
+
+---
+
+### 帧钉定（pin_frames + Apply Frame Pin）—— 真正把某些帧钉成原图
+
+上一节说明：关键帧在 DiT 里只是**软上下文**，输出是整段生成的，所以不能指望 head/tail
+「原样钉死」。但很多场景确实需要「输入的那几帧在出来时还是那几帧」。本节点用**采样后
+latent 拼接**做到这一点，无需重训：
+
+1. 主节点 `pin_frames = 开启`（默认）时，除了软条件，还会额外输出一个 `pin` 规格：
+   列表里每一项都是 `(latent token 槽位, 干净的关键帧 latent)`，即「被条件占用的每个
+   latent token 在完整时间轴里的位置 + 它对应的 VAE 编码原图」。
+2. 把主节点的 `latent` 送进采样器，再把采样结果与 `pin` 一起送进 **`MiniMax H3 Apply
+   Frame Pin`**（放在采样器之后、VAE 解码之前）。
+3. `Apply Frame Pin` 把 `pin` 里的干净 latent **原样覆盖**到采样结果的对应 token 槽位
+   （`video[:, :, slot] = keyframe_latent`）。
+4. 之后正常 VAE 解码——被覆盖的 token 解码回去就是**输入原图**（VAE 编解码在该分辨率下
+   近似无损），所以那些帧精确等于输入。
+
+**为什么必须放在采样之后、且要第二个节点？**
+条件节点只能给采样器喂数据，拿不到采样器的输出；而 DiT 本身从不把关键帧拷贝进输出。
+唯一可靠的「钉死」是在采样完成的 latent 上、于被条件占用的 token 槽位直接回填干净 latent
+——这就是 latent 层面的视频帧 inpainting，跟训练无关，100% 可靠。
+
+**槽位映射（已用算例验证）**：每个关键帧的 `resolved_frame_index` 是其 latent token 起始的
+像素帧号；完整时间轴的 token 起始像素帧号由 `token_frame_offsets(latent_t)` 给出，二者
+求交集即得槽位。`frame_count = 124`（→ `latent_t = 37`）时：像素帧 `0, 1, 119, 120`
+→ 槽位 `0, 1, 35, 36`。head 段占前几个槽位、tail 段占最后几个槽位，完全对齐 token 边界。
+
+**要点**
+- `pin` 是一个自定义类型（`minimax_pin_spec`）的输出；`pin_frames` 关闭或没给任何帧时
+  `pin` 为空列表，`Apply Frame Pin` 自动变成空操作（no-op）。
+- 被钉的帧是「按生成分辨率 VAE 编码后的输入」（head 段拉伸、tail 段居中裁剪，与模型看到的
+  条件一致），所以解码出来是那一分辨率下的原图。
+- 这只钉「被条件占用的帧」（head/tail 段）；中段仍自由生成。`pin_frames` 不影响软条件本身，
+  两者叠加：软条件让中段与钉定帧连贯，钉定保证指定帧精确。
+- 若你只想要「强引导但允许轻微漂移」，把 `pin_frames` 关掉即可，此时不需要 `Apply Frame Pin`。
 
 ---
 
@@ -199,6 +244,12 @@ cond_t = text_len + FRAME_RESCALE * pixel_index
 - 首段用拉伸（`disabled`），尾段用居中裁剪（`center`），与内置节点的策略一致。
 - `cond_noise_aug` 暴露了核心已支持但没有节点设置的 `minimax_visual_cond_noise_aug`。
 - `prompt_frames` 只影响 Qwen 侧 `<Picture>` 的取帧（详见上文），不改变 DiT 关键帧条件。
+- `pin_frames`（默认开启）时，额外用 `grid.build_pin_spec` 把每个关键帧映射成
+  `(token 槽位, 干净 latent)`，作为自定义类型 `minimax_pin_spec` 的输出 `pin` 发出；
+  供 `MiniMaxH3ApplyFramePin` 在采样后回填。
+- `MiniMaxH3ApplyFramePin`：从 `latent["samples"]`（NestedTensor）取出视频 latent，
+  对每个 `(slot, kf)` 做 `video[0, :, slot, :, :] = kf[0, :, 0, :, :]`，拼回 NestedTensor
+  输出。`pin` 为空时是空操作。
 
 ### 与内置节点的等价性
 
@@ -223,3 +274,5 @@ cond_t = text_len + FRAME_RESCALE * pixel_index
 - 输入帧数会被 snap 到合法段长 `1, 5, 22, 39, ...`，超出部分静默丢弃。
 - 多帧连续段条件（尤其 run 内部非锚点帧）超出 FL2VA 训练分布，其视觉质量与运动连贯性属
   实验性，以实际测试为准。
+- 要真正钉死帧（像素级等于输入），必须接 `MiniMax H3 Apply Frame Pin` 节点（采样后、解码前），
+  并把主节点的 `pin` 输出连过去；只开 `pin_frames` 而不接该节点时，仅有软条件、不会钉死。
